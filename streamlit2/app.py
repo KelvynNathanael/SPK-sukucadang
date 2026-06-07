@@ -8,7 +8,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
-LOCAL_DATA_PATH = '../DataPenjualanGaikindo.xlsx'
+LOCAL_DATA_PATH = Path(__file__).parent / 'DataPenjualanGaikindo.xlsx'
 
 from fuzzy_ahp import (
     RI_TABLE,
