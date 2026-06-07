@@ -317,7 +317,7 @@ with st.sidebar:
             st.download_button(
                 label="Download Data Gaikindo",
                 data=f,
-                file_name="../DataPenjualanGaikindo.xlsx",
+                file_name="DataPenjualanGaikindo.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
                 help="Download dulu, lalu upload di bawah.",
