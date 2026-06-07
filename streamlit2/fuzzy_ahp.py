@@ -60,7 +60,6 @@ def buildCriteriaTable(
     result = df[["BRAND", "MODEL", "CC", "bulanAktif"]].copy()
     result = result.rename(columns={"BRAND": "Brand", "MODEL": "Model"})
 
-    # C1 - Tren populasi (historis +/- forecast)
     filteredTotal = df[monthCols].sum(axis=1)
     if forecastTotals:
         result["C1_total"] = result.index.map(
@@ -69,10 +68,8 @@ def buildCriteriaTable(
     else:
         result["C1_total"] = filteredTotal
 
-    # C2 - Kapasitas Mesin (CC)
     result["C2_cc"] = result["CC"]
 
-    # C3 - Gross Vehicle Weight (GVW)
     gvwCol = findCol(df, ["GVW", "GROSS_VEHICLE", "GROSS VEHICLE", "BERAT"])
     if gvwCol:
         result["C3_gvw"] = (
@@ -83,7 +80,6 @@ def buildCriteriaTable(
         result["C3_gvw"] = 0.0
         c3Available = False
 
-    # C4 - Horse Power (HP / PS / KW)
     hpCol = findCol(df, ["HP", "HORSE", "POWER", " PS", "_PS", "KW"])
     if hpCol:
         result["C4_hp"] = (
@@ -187,7 +183,6 @@ def fuzzyExtentAnalysis(
 ) -> Tuple[np.ndarray, Dict]:
     n = matrix.shape[0]
 
-    # Step 1: Fuzzy synthetic extent Si
     rowSums = []
     for i in range(n):
         l = sum(float(matrix[i][j][0]) for j in range(n))
@@ -208,7 +203,6 @@ def fuzzyExtentAnalysis(
         for (rl, rm, ru) in rowSums
     ]
 
-    # Step 2: Degree of possibility V(Si >= Sj)
     def degreeOfPossibility(M1: tuple, M2: tuple) -> float:
         l1, m1, u1 = M1
         l2, m2, u2 = M2
@@ -221,7 +215,6 @@ def fuzzyExtentAnalysis(
             return 0.0
         return (l1 - u2) / denom
 
-    # vMatrix[i][j] = V(Sj >= Si) -> how much Sj dominates Si
     vMatrix = np.zeros((n, n))
     for i in range(n):
         for j in range(n):
@@ -230,13 +223,11 @@ def fuzzyExtentAnalysis(
             else:
                 vMatrix[i][j] = round(degreeOfPossibility(Si[j], Si[i]), 6)
 
-    # Step 3: Raw weight = min V(Si >= Sk) for all k != i
     rawWeights = np.zeros(n)
     for i in range(n):
         others = [vMatrix[i][j] for j in range(n) if j != i]
         rawWeights[i] = min(others) if others else 1.0
 
-    # Step 4: Normalise
     totalW = rawWeights.sum()
     weights = rawWeights / totalW if totalW > 0 else np.full(n, 1.0 / n)
 
@@ -302,7 +293,7 @@ def findInconsistencies(
         else:
             direction[(i, j)] = 0
             direction[(j, i)] = 0
-            
+
     transitivityViolations = []
     for a in range(n):
         for b in range(n):

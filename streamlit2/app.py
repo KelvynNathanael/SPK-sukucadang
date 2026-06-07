@@ -69,6 +69,16 @@ SCALE_STEPS = [-9, -7, -5, -3, 1, 3, 5, 7, 9]
 
 ACTIVE_YEAR = 2025
 
+# ── Komponen suku cadang & frekuensi penggantian (per kendaraan/tahun) ────────
+# Frekuensi = berapa kali rata-rata komponen ini diganti dalam setahun per kendaraan
+KOMPONEN: dict[str, float] = {
+    "Filter Oli":   2.0,   # ganti tiap ~6 bulan
+    "Oli Mesin":    2.0,
+    "Filter Udara": 1.0,   # ganti tiap ~12 bulan
+    "Kampas Rem":   0.5,   # ganti tiap ~2 tahun
+    "Busi":         0.5,
+}
+
 
 def prefOptions(cxLabel: str, cyLabel: str) -> list[tuple[int, str]]:
     return [
@@ -102,8 +112,45 @@ def isDiscontinued(row: pd.Series, monthCols: list[str], activeYear: int = ACTIV
 
 def hasEnoughConsecutive(row: pd.Series, monthCols: list[str], minConsec: int = 24) -> bool:
     series = pd.Series(row[monthCols].values, dtype=float).fillna(0).clip(lower=0)
+    first_sale = findFirstSale(series)
+    series = series.iloc[first_sale:].reset_index(drop=True)
     return maxConsecutiveNonZero(series) >= minConsec
 
+
+def buildYearLabels(monthCols: list[str]) -> list[str]:
+    MONTH_MAP = {
+        "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+        "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+    }
+    labels = []
+    for col in monthCols:
+        parts = col.split("_")
+        if len(parts) == 2:
+            m = MONTH_MAP.get(parts[0], 1)
+            y = parts[1]
+            labels.append(f"{y}-{m:02d}")
+        else:
+            labels.append(col)
+    return labels
+
+
+def buildForecastYearLabels(lastHistLabel: str, periods: int) -> list[str]:
+    parts = lastHistLabel.split("-")
+    year, month = int(parts[0]), int(parts[1])
+    labels = []
+    for _ in range(periods):
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+        labels.append(f"{year}-{month:02d}")
+    return labels
+
+def findFirstSale(series: pd.Series) -> int:
+    nonzero = np.where(series.values > 0)[0]
+    if len(nonzero) == 0:
+        return len(series)
+    return int(nonzero[0])
 
 @st.cache_data(show_spinner=False)
 def loadDataFromBytes(fileBytes: bytes):
@@ -119,12 +166,17 @@ def forecastOne(
     periods: int = 12,
     season: int = 12,
     holdoutMonths: int = 12,
-) -> tuple[list[float], float | None, float | None]:
+) -> tuple[list[float], list[float], float | None, float | None]:
     series = pd.Series(monthlySales, dtype=float).fillna(0).clip(lower=0)
 
+    first_sale = findFirstSale(series)
+    trimOffset = first_sale
+    series     = series.iloc[first_sale:].reset_index(drop=True)
+
     if maxConsecutiveNonZero(series) < season * 2:
-        meanVal = series.tail(min(12, len(series))).mean()
-        return [max(0.0, float(meanVal))] * periods, None, None
+        meanVal      = series.tail(min(12, len(series))).mean()
+        fittedPadded = [0.0] * trimOffset + series.tolist()
+        return fittedPadded, [max(0.0, float(meanVal))] * periods, None, None
 
     rmse: float | None = None
     mape: float | None = None
@@ -133,31 +185,7 @@ def forecastOne(
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
 
-            minTrainLen = season * 2
-            if len(series) >= minTrainLen + holdoutMonths:
-                trainSeries = series.iloc[:-holdoutMonths]
-                actualHoldout = series.iloc[-holdoutMonths:].values
-
-                valModel = ExponentialSmoothing(
-                    trainSeries,
-                    trend="add",
-                    seasonal="add",
-                    seasonal_periods=season,
-                    initialization_method="estimated",
-                ).fit(optimized=True)
-
-                predHoldout = valModel.forecast(holdoutMonths).clip(lower=0).values
-
-                rmse = float(np.sqrt(np.mean((actualHoldout - predHoldout) ** 2)))
-
-                nonzeroMask = actualHoldout > 0
-                if nonzeroMask.any():
-                    rawMape = np.abs(
-                        (actualHoldout[nonzeroMask] - predHoldout[nonzeroMask])
-                        / actualHoldout[nonzeroMask]
-                    ) * 100
-                    mape = float(np.mean(np.clip(rawMape, 0, 200)))
-
+            # ── Full model fit dulu ────────────────────────────────────────────
             fullModel = ExponentialSmoothing(
                 series,
                 trend="add",
@@ -165,25 +193,50 @@ def forecastOne(
                 seasonal_periods=season,
                 initialization_method="estimated",
             ).fit(optimized=True)
-            fc = fullModel.forecast(periods).clip(lower=0)
-            return fc.tolist(), rmse, mape
+
+            fittedTrimmed = fullModel.fittedvalues.clip(lower=0).tolist()
+            fittedPadded  = [0.0] * trimOffset + fittedTrimmed
+            fc            = fullModel.forecast(periods).clip(lower=0)
+
+            # ── Hitung RMSE & MAPE dari residual in-sample ─────────────────────
+            # Pakai N bulan terakhir fitted vs actual sebagai "holdout" evaluasi
+            # Ini valid karena: kita tidak pakai fitted untuk forecast,
+            # forecast tetap dari fullModel. Metrik ini menunjukkan
+            # seberapa baik model menangkap pola historis.
+            evalN = min(holdoutMonths, len(series) - season)  # minimal sisakan 1 siklus
+            if evalN > 0:
+                actualEval = series.iloc[-evalN:].values
+                fittedEval = np.array(fittedTrimmed[-evalN:])
+
+                rmse = float(np.sqrt(np.mean((actualEval - fittedEval) ** 2)))
+
+                nonzeroMask = actualEval > 0
+                if nonzeroMask.any():
+                    rawMape = np.abs(
+                        (actualEval[nonzeroMask] - fittedEval[nonzeroMask])
+                        / actualEval[nonzeroMask]
+                    ) * 100
+                    mape = float(np.mean(np.clip(rawMape, 0, 200)))
+
+            return fittedPadded, fc.tolist(), rmse, mape
 
     except Exception:
-        meanVal = series.tail(min(12, len(series))).mean()
-        return [max(0.0, float(meanVal))] * periods, None, None
-
+        meanVal      = series.tail(min(12, len(series))).mean()
+        fittedPadded = [0.0] * trimOffset + series.tolist()
+        return fittedPadded, [max(0.0, float(meanVal))] * periods, None, None
 
 @st.cache_data(show_spinner=False)
 def computeAllForecasts(
     df: pd.DataFrame,
     monthCols: list[str],
     periods: int = 12,
-) -> tuple[dict, dict, dict]:
-    forecastTotals: dict     = {}
-    forecastSeriesDict: dict = {}
-    metricsDict: dict        = {}
-    discontinuedCount        = 0
-    shortDataCount           = 0
+) -> tuple[dict, dict, dict, dict]:
+    forecastTotals: dict      = {}
+    forecastSeriesDict: dict  = {}
+    fittedSeriesDict: dict    = {}
+    metricsDict: dict         = {}
+    discontinuedCount         = 0
+    shortDataCount            = 0
 
     progress = st.progress(0.0, text="Memproses Holt-Winters...")
     n = len(df)
@@ -192,29 +245,32 @@ def computeAllForecasts(
         row = df.loc[idx]
 
         if isDiscontinued(row, monthCols):
-            discontinuedCount      += 1
-            forecastTotals[idx]     = 0.0
-            forecastSeriesDict[idx] = []
-            metricsDict[idx]        = {
+            discontinuedCount         += 1
+            forecastTotals[idx]        = 0.0
+            forecastSeriesDict[idx]    = []
+            fittedSeriesDict[idx]      = []
+            metricsDict[idx]           = {
                 "rmse": None, "mape": None,
                 "discontinued": True, "skip_reason": "no_sales_2025",
             }
 
         elif not hasEnoughConsecutive(row, monthCols, minConsec=24):
-            shortDataCount         += 1
-            forecastTotals[idx]     = 0.0
-            forecastSeriesDict[idx] = []
-            metricsDict[idx]        = {
+            shortDataCount            += 1
+            forecastTotals[idx]        = 0.0
+            forecastSeriesDict[idx]    = []
+            fittedSeriesDict[idx]      = []
+            metricsDict[idx]           = {
                 "rmse": None, "mape": None,
                 "discontinued": True, "skip_reason": "consec_lt_24",
             }
 
         else:
             sales = tuple(row[monthCols].values.tolist())
-            fc, rmse, mape          = forecastOne(sales, periods=periods, holdoutMonths=12)
-            forecastTotals[idx]     = float(sum(fc))
-            forecastSeriesDict[idx] = fc
-            metricsDict[idx]        = {
+            fitted, fc, rmse, mape     = forecastOne(sales, periods=periods, holdoutMonths=12)
+            forecastTotals[idx]        = float(sum(fc))
+            forecastSeriesDict[idx]    = fc
+            fittedSeriesDict[idx]      = fitted
+            metricsDict[idx]           = {
                 "rmse": rmse, "mape": mape,
                 "discontinued": False, "skip_reason": None,
             }
@@ -224,28 +280,13 @@ def computeAllForecasts(
 
     progress.empty()
 
-    msgs = []
-    if discontinuedCount > 0:
-        msgs.append(
-            f"**{discontinuedCount} model** tidak ada penjualan di {ACTIVE_YEAR} "
-            f"(discontinue)."
-        )
-    if shortDataCount > 0:
-        msgs.append(
-            f"**{shortDataCount} model** punya data berturut-turut < 24 bulan "
-            f"→ di-skip dari forecast & metrik akurasi."
-        )
+    return forecastTotals, forecastSeriesDict, fittedSeriesDict, metricsDict
 
-    return forecastTotals, forecastSeriesDict, metricsDict
 
-def calcEoq(demand, orderingCost, holdingCost):
+def calcEoq(demand: float, orderingCost: float, holdingCost: float) -> int:
     if holdingCost <= 0 or demand <= 0:
         return 0
     return int(np.ceil(np.sqrt((2 * demand * orderingCost) / holdingCost)))
-
-
-def calcDemand(targetPerBulan, freqPerTahun):
-    return int(targetPerBulan * 12 * freqPerTahun)
 
 
 def mapeColorClass(mape: float | None) -> str:
@@ -257,7 +298,7 @@ def mapeColorClass(mape: float | None) -> str:
         return "metric-warn"
     return "metric-bad"
 
-# ─── SIDEBAR BAGIAN ATAS (tidak bergantung data) ──────────────────────────────
+# ─── SIDEBAR ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown(
         '<p style="font-size:1.1rem;font-weight:600;margin-bottom:0">'
@@ -276,7 +317,7 @@ with st.sidebar:
             st.download_button(
                 label="Download Data Gaikindo",
                 data=f,
-                file_name="DataPenjualanGaikindo.xlsx",
+                file_name="../DataPenjualanGaikindo.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
                 help="Download dulu, lalu upload di bawah.",
@@ -313,28 +354,24 @@ with st.sidebar:
     )
 
     targetServis = st.number_input(
-        "Kapasitas Total Bengkel per Bulan (kendaraan)",
-        min_value=1, max_value=10000, value=200, step=10,
+        "Kapasitas Servis Bengkel per Bulan (kendaraan)",
+        min_value=1, max_value=10000, value=100, step=10,
         help=(
-            "Total kendaraan yang mampu diservis bengkel per bulan. "
-            "Permintaan suku cadang tiap model dialokasikan secara proporsional "
-            "terhadap skor prioritas Fuzzy AHP."
+            "Total kendaraan yang mampu diservis bengkel Anda per bulan. "
+            "Demand suku cadang tiap model dihitung secara proporsional "
+            "dari tren penjualan C1 (historis + forecast) terhadap total "
+            "tren semua model dalam Top-N yang dipilih."
         ),
     )
     biayaPesan = st.number_input(
         "Biaya Sekali Pesan (Rp)",
         min_value=0, value=5_000, step=1_000,
-        help=(
-            "Biaya tetap setiap kali melakukan pemesanan suku cadang, "
-            "terlepas dari jumlah unit yang dipesan."
-        ),
+        help="Biaya tetap setiap kali melakukan pemesanan suku cadang.",
     )
     biayaSimpan = st.number_input(
         "Biaya Simpan per Unit per Tahun (Rp)",
         min_value=0, value=5_000, step=1_000,
-        help=(
-            "Biaya penyimpanan per unit suku cadang per tahun."
-        )
+        help="Biaya penyimpanan per unit suku cadang per tahun.",
     )
 
     st.divider()
@@ -382,6 +419,11 @@ if uploadedFile is None and not st.session_state.get("use_local"):
         > Model yang tidak memiliki penjualan di seluruh bulan tahun **2025** dianggap
         > discontinue dan **tidak di-forecast**. C1 tetap dihitung dari akumulasi historis.
 
+        **Cara hitung demand EOQ:**
+        > Demand tiap model dihitung dari **proporsi tren penjualan C1** (historis + forecast)
+        > model tersebut terhadap total C1 semua model dalam Top-N, dikalikan kapasitas
+        > servis bengkel dan frekuensi penggantian komponen.
+
         **Kriteria Evaluasi:**
         | Kode | Kriteria | Keterangan |
         |------|----------|------------|
@@ -404,7 +446,9 @@ if len(dfFull) == 0:
     st.warning("Data kosong setelah cleaning. Periksa format file Excel.")
     st.stop()
 
-# ─── SIDEBAR FILTER TAHUN (bergantung data) ───────────────────────────────────
+yearLabels = buildYearLabels(monthCols)
+
+# ─── SIDEBAR FILTER TAHUN & CC ────────────────────────────────────────────────
 allYears = sorted({int(c.split("_")[1]) for c in monthCols})
 
 with st.sidebar:
@@ -424,43 +468,85 @@ with st.sidebar:
         ),
     )
 
-# ─── FILTER ROWS: hanya model yang punya penjualan di rentang tahun terpilih ──
+    st.divider()
+    st.markdown(
+        '<p style="font-weight:600">&nbsp;Filter Kapasitas Mesin (CC)</p>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Filter ini mempengaruhi ranking, forecast, dan EOQ secara global. "
+        "Gunakan filter CC di tab Ranking untuk filter tampilan saja."
+    )
+
+    ccColFull = dfFull["CC"].fillna(0)
+    ccMinGlobal = int(ccColFull[ccColFull > 0].min()) if (ccColFull > 0).any() else 0
+    ccMaxGlobal = int(ccColFull.max())
+
+    if ccMaxGlobal > ccMinGlobal:
+        globalCcRange = st.slider(
+            "Rentang CC (cc)",
+            min_value=ccMinGlobal,
+            max_value=ccMaxGlobal,
+            value=(ccMinGlobal, ccMaxGlobal),
+            step=100,
+            help=(
+                "Model dengan CC di luar rentang ini akan dikeluarkan dari seluruh "
+                "perhitungan (AHP, forecast, EOQ)."
+            ),
+        )
+    else:
+        globalCcRange = (ccMinGlobal, ccMaxGlobal)
+        st.info(f"Semua model memiliki CC yang sama ({ccMinGlobal} cc).")
+
+# ─── FILTER ROWS ──────────────────────────────────────────────────────────────
 yearFilterCols = [
     c for c in monthCols
     if yearRange[0] <= int(c.split("_")[1]) <= yearRange[1]
 ]
 
 activeInRange = dfFull[yearFilterCols].sum(axis=1) > 0
-df = dfFull[activeInRange].reset_index(drop=True)
+df = dfFull[activeInRange].copy()
+
+ccMask = (
+    (df["CC"].fillna(0) >= globalCcRange[0]) &
+    (df["CC"].fillna(0) <= globalCcRange[1])
+)
+df = df[ccMask].reset_index(drop=True)
 
 if len(df) == 0:
     st.warning(
-        f"Tidak ada model dengan penjualan di tahun {yearRange[0]}–{yearRange[1]}. "
-        "Coba perlebar rentang tahun di sidebar."
+        f"Tidak ada model yang cocok dengan filter tahun **{yearRange[0]}–{yearRange[1]}** "
+        f"dan CC **{globalCcRange[0]}–{globalCcRange[1]} cc**. "
+        "Coba perlebar rentang di sidebar."
     )
     st.stop()
 
-# Tampilkan info filter jika tidak semua tahun dipilih
+filterInfoParts = []
 if yearRange != (allYears[0], allYears[-1]):
+    filterInfoParts.append(f"Tahun **{yearRange[0]}–{yearRange[1]}**")
+if globalCcRange != (ccMinGlobal, ccMaxGlobal):
+    filterInfoParts.append(f"CC **{globalCcRange[0]}–{globalCcRange[1]} cc**")
+
+if filterInfoParts:
     filteredOut = len(dfFull) - len(df)
     st.info(
-        f"Filter aktif: **{yearRange[0]}–{yearRange[1]}** — "
+        f"Filter aktif: {' · '.join(filterInfoParts)} — "
         f"menampilkan **{len(df)} model** "
-        f"({filteredOut} model disembunyikan karena tidak aktif di rentang ini)."
+        f"({filteredOut} model disembunyikan)."
     )
 
-# ─── REBUILD modelToDfIdx setelah filter ──────────────────────────────────────
 modelToDfIdx = {
     (df.loc[i, "BRAND"], df.loc[i, "MODEL"]): i for i in df.index
 }
 
-# ─── FORECAST (pakai df yang sudah difilter) ──────────────────────────────────
-forecastTotals    = None
+# ─── FORECAST ─────────────────────────────────────────────────────────────────
+forecastTotals     = None
 forecastSeriesDict: dict = {}
+fittedSeriesDict: dict   = {}
 metricsDict: dict        = {}
 
 if enableForecast:
-    forecastTotals, forecastSeriesDict, metricsDict = computeAllForecasts(
+    forecastTotals, forecastSeriesDict, fittedSeriesDict, metricsDict = computeAllForecasts(
         df, monthCols, periods=forecastPeriods
     )
 
@@ -485,7 +571,6 @@ st.markdown(
     f'background:{"#f0fdf4" if crOk else "#fef2f2"};'
     f'border:1px solid {"#86efac" if crOk else "#fca5a5"};margin-bottom:12px">'
     f'<span class="{crClass}">{crSymbol} Consistency Ratio (CR) = {cr:.4f} — {crText}</span>'
-    f'&nbsp;&nbsp;<span style="color:#6b7280;font-size:0.85rem">'
     f'</div>',
     unsafe_allow_html=True,
 )
@@ -544,38 +629,76 @@ for col, lbl, w, na in zip(wCols, wLabels, weights, unavail):
 
 st.divider()
 
-tabRank, tabFahp, tabForecast, tabEoq = st.tabs([
+# ─── TABS ─────────────────────────────────────────────────────────────────────
+tabRank, tabForecast, tabEoq = st.tabs([
     "Ranking Prioritas",
-    "Detail Fuzzy AHP",
     "Visualisasi Tren & Akurasi",
     "Rekomendasi EOQ",
 ])
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — RANKING
+# ═══════════════════════════════════════════════════════════════════════════════
 with tabRank:
     st.markdown("<h3>Tabel Ranking Model Kendaraan</h3>", unsafe_allow_html=True)
 
-    colA, colB = st.columns([3, 1])
-    with colA:
-        topN = st.slider("Tampilkan Top-N", 5, min(100, len(rankedDf)), 20)
-    with colB:
+    col1, col2, col3 = st.columns([2, 2, 1])
+
+    with col1:
         brandFilter = st.multiselect(
             "Filter Merek",
             options=sorted(rankedDf["Brand"].unique()),
             default=[],
         )
 
+    with col2:
+        ccColRanked = rankedDf["CC"].fillna(0)
+        ccMinTab = int(ccColRanked[ccColRanked > 0].min()) if (ccColRanked > 0).any() else 0
+        ccMaxTab = int(ccColRanked.max())
+
+        if ccMaxTab > ccMinTab:
+            ccRangeTab = st.slider(
+                "Filter CC (tampilan)",
+                min_value=ccMinTab,
+                max_value=ccMaxTab,
+                value=(ccMinTab, ccMaxTab),
+                step=100,
+                help=(
+                    "Filter CC ini hanya mempengaruhi tampilan tabel di tab ini. "
+                    "Tidak mempengaruhi perhitungan AHP, forecast, maupun EOQ."
+                ),
+            )
+        else:
+            ccRangeTab = (ccMinTab, ccMaxTab)
+
+    with col3:
+        topN = st.slider("Tampilkan Top-N", 5, min(100, len(rankedDf)), 20)
+
     displayDf = rankedDf.copy()
+
     if brandFilter:
         displayDf = displayDf[displayDf["Brand"].isin(brandFilter)]
 
-    showCols  = ["Brand", "Model", "CC", "C1_total", "C2_cc", "C3_gvw", "C4_hp"]
+    displayDf = displayDf[
+        (displayDf["CC"].fillna(0) >= ccRangeTab[0]) &
+        (displayDf["CC"].fillna(0) <= ccRangeTab[1])
+    ]
+
+    totalRanked = len(rankedDf)
+    totalShown  = len(displayDf)
+    if totalShown < totalRanked:
+        st.caption(
+            f"Menampilkan **{min(topN, totalShown)}** dari **{totalShown}** model "
+            f"(filter aktif dari total {totalRanked} model)."
+        )
+
+    showCols  = ["Brand", "Model", "CC", "C1_total", "C3_gvw", "C4_hp"]
     renameMap = {
         "Brand":    "Merek",
         "Model":    "Model",
-        "CC":       "CC",
+        "CC":       "CC (cc)",
         "C1_total": "Tren Populasi",
-        "C2_cc":    "CC (C2)",
         "C3_gvw":   "GVW (C3)",
         "C4_hp":    "HP (C4)",
     }
@@ -599,74 +722,9 @@ with tabRank:
     )
 
 
-
-with tabFahp:
-    st.markdown("<h3>Detail Perhitungan Fuzzy AHP (4 Kriteria)</h3>", unsafe_allow_html=True)
-    st.caption("Chang's Extent Analysis — 4×4 matrix")
-
-    st.markdown("**Matriks Perbandingan Berpasangan (nilai tengah TFN)**")
-    nCrit = 4
-    tableData = {}
-    for i, ci in enumerate(CRITERIA_NAMES):
-        row = {}
-        for j, cj in enumerate(CRITERIA_NAMES):
-            m = float(matrix[i][j][1])
-            row[cj] = f"{m:.3f}" if m != 1.0 else "1.000"
-        tableData[ci] = row
-    st.dataframe(pd.DataFrame(tableData).T, use_container_width=False)
-
-    st.divider()
-
-    colL, colR = st.columns(2)
-    with colL:
-        st.markdown("**Nilai Sintesis Fuzzy (Si)**")
-        Si = fahpDebug["Si"]
-        siRows = [
-            {"Kriteria": CRITERIA_NAMES[i], "l": round(l, 6), "m": round(m, 6), "u": round(u, 6)}
-            for i, (l, m, u) in enumerate(Si)
-        ]
-        st.dataframe(pd.DataFrame(siRows).set_index("Kriteria"), use_container_width=True)
-
-    with colR:
-        st.markdown("**Bobot Akhir (W)**")
-        wRows = [
-            {"Kriteria": CRITERIA_NAMES[i], "Bobot": round(float(w), 6), "Persen": f"{float(w)*100:.2f}%"}
-            for i, w in enumerate(weights)
-        ]
-        st.dataframe(pd.DataFrame(wRows).set_index("Kriteria"), use_container_width=True)
-
-    st.divider()
-    st.markdown("**Matriks Degree of Possibility V(Si ≥ Sj)**")
-    V = fahpDebug["V_matrix"]
-    vDf = pd.DataFrame(V.round(6), index=CRITERIA_NAMES, columns=CRITERIA_NAMES)
-    st.dataframe(vDf, use_container_width=False)
-
-    st.divider()
-    st.markdown("**Uji Konsistensi**")
-    ciVal = (lambdaMax - nCrit) / (nCrit - 1)
-    riVal = RI_TABLE[nCrit]
-    statusStr = "Konsisten ✓" if crOk else "Tidak Konsisten ✗"
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("lambda_max", f"{lambdaMax:.4f}")
-    col2.metric("CI",         f"{ciVal:.4f}")
-    col3.metric("RI (n=4)",   f"{riVal}")
-    col4.metric("CR", f"{cr:.4f}", delta=statusStr, delta_color="normal" if crOk else "inverse")
-
-    figW = go.Figure(go.Bar(
-        x=CRITERIA_NAMES,
-        y=[float(w) * 100 for w in weights],
-        text=[f"{float(w)*100:.1f}%" for w in weights],
-        textposition="auto",
-        marker_color=["#3b82f6", "#10b981", "#f59e0b", "#8b5cf6"],
-    ))
-    figW.update_layout(
-        title="Visualisasi Bobot Kriteria",
-        yaxis_title="Bobot (%)",
-        height=350,
-        showlegend=False,
-    )
-    st.plotly_chart(figW, use_container_width=True)
-
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — FORECAST / TREN
+# ═══════════════════════════════════════════════════════════════════════════════
 with tabForecast:
     st.markdown("<h3>Tren Peramalan per Model</h3>", unsafe_allow_html=True)
 
@@ -741,11 +799,24 @@ with tabForecast:
         max_selections=5,
     )
 
+    showFitted = False
+    if enableForecast:
+        showFitted = st.checkbox(
+            "Tampilkan garis prediksi dalam periode historis (in-sample fit)",
+            value=True,
+            help=(
+                "Menampilkan seberapa baik model Holt-Winters mencocokkan data historis. "
+                "Semakin dekat garis prediksi dengan garis aktual, semakin baik model."
+            ),
+        )
+
     if selected:
         fig = go.Figure()
         selectedMetrics = []
 
-        for sel in selected:
+        COLOR_PALETTE = ["#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ef4444"]
+
+        for selIdx, sel in enumerate(selected):
             cleanSel = sel.replace(" [discontinue]", "")
             try:
                 _, brandPart = cleanSel.split(" ", 1)
@@ -757,104 +828,272 @@ with tabForecast:
             if dfIdx is None:
                 continue
 
-            historical = df.loc[dfIdx, monthCols].values
-            xHist      = list(range(len(historical)))
-            isDisc     = metricsDict.get(dfIdx, {}).get("discontinued", False)
-            modelLabel = f"{brand} {model}"
+            historical   = df.loc[dfIdx, monthCols].values.astype(float)
+            xHist        = yearLabels
+            isDisc       = metricsDict.get(dfIdx, {}).get("discontinued", False)
+            modelLabel   = f"{brand} {model}"
+            baseColor    = COLOR_PALETTE[selIdx % len(COLOR_PALETTE)]
+            lineColor    = "#9ca3af" if isDisc else baseColor
 
-            lineColor  = "#9ca3af" if isDisc else None
             fig.add_trace(go.Scatter(
                 x=xHist,
                 y=historical,
                 mode="lines",
-                name=f"{modelLabel} (Historis)" + (" — discontinue" if isDisc else ""),
+                name=f"{modelLabel} — Aktual" + (" (discontinue)" if isDisc else ""),
                 line=dict(width=2, color=lineColor),
+                legendgroup=modelLabel,
             ))
 
-            if enableForecast and not isDisc and dfIdx in forecastSeriesDict and forecastSeriesDict[dfIdx]:
-                fc   = forecastSeriesDict[dfIdx]
-                xFc  = list(range(len(historical), len(historical) + len(fc)))
-                fig.add_trace(go.Scatter(
-                    x=[xHist[-1]] + xFc,
-                    y=[float(historical[-1])] + list(fc),
-                    mode="lines",
-                    name=f"{modelLabel} (Forecast)",
-                    line=dict(width=2, dash="dash"),
-                ))
+            if enableForecast and not isDisc:
+                fitted = fittedSeriesDict.get(dfIdx, [])
+                fc     = forecastSeriesDict.get(dfIdx, [])
+
+                if showFitted and fitted:
+                    fig.add_trace(go.Scatter(
+                        x=xHist,
+                        y=fitted,
+                        mode="lines",
+                        name=f"{modelLabel} — Fitted (HW)",
+                        line=dict(width=1.5, color=lineColor, dash="dot"),
+                        legendgroup=modelLabel,
+                        opacity=0.75,
+                    ))
+
+                if fc:
+                    fcLabels = buildForecastYearLabels(xHist[-1], len(fc))
+                    fig.add_trace(go.Scatter(
+                        x=[xHist[-1]] + fcLabels,
+                        y=[float(historical[-1])] + list(fc),
+                        mode="lines",
+                        name=f"{modelLabel} — Forecast",
+                        line=dict(width=2, color=lineColor, dash="dash"),
+                        legendgroup=modelLabel,
+                    ))
 
             if enableForecast and dfIdx in metricsDict:
                 m = metricsDict[dfIdx]
                 selectedMetrics.append({
-                    "Model":        modelLabel,
-                    "Status":       "Discontinue" if m["discontinued"] else "Aktif",
-                    "RMSE":         f"{m['rmse']:,.1f}" if m["rmse"] is not None else "—",
-                    "MAPE (%)":     f"{m['mape']:.2f}%" if m["mape"] is not None else "—",
+                    "Model":    modelLabel,
+                    "Status":   "Discontinue" if m["discontinued"] else "Aktif",
+                    "RMSE":     f"{m['rmse']:,.1f}" if m["rmse"] is not None else "—",
+                    "MAPE (%)": f"{m['mape']:.2f}%" if m["mape"] is not None else "—",
                 })
 
+        title_suffix = ""
+        if enableForecast and showFitted:
+            title_suffix = " | garis titik-titik = fitted HW | garis putus-putus = forecast"
+        elif enableForecast:
+            title_suffix = " | garis putus-putus = forecast ke depan"
+
         fig.update_layout(
-            title="Penjualan Bulanan (garis abu = discontinue, garis putus = forecast)",
-            xaxis_title="Periode (bulan ke-)",
-            yaxis_title="Volume Penjualan (unit)",
+            title=f"Penjualan Tahunan per Model{title_suffix}",
+            xaxis_title="Tahun-Bulan",
+            yaxis_title="Volume Penjualan (unit/bulan)",
             hovermode="x unified",
-            height=500,
-            legend=dict(orientation="h", yanchor="bottom", y=-0.35, xanchor="left", x=0),
+            height=520,
+            xaxis=dict(
+                tickangle=-45,
+                tickmode="array",
+                tickvals=[lbl for lbl in yearLabels if lbl.endswith("-01")],
+                ticktext=[lbl[:4] for lbl in yearLabels if lbl.endswith("-01")],
+            ),
+            legend=dict(orientation="h", yanchor="bottom", y=-0.45, xanchor="left", x=0),
         )
         st.plotly_chart(fig, use_container_width=True)
+
+        st.caption(
+            "Sumbu X menampilkan label tahun (tick di bulan Januari). "
+            "Hover untuk melihat nilai tiap bulan secara tepat."
+        )
 
         if enableForecast and selectedMetrics:
             st.markdown("**Metrik Akurasi Model yang Dipilih**")
             st.caption(
-                "Model discontinue tidak di-forecast sehingga tidak memiliki metrik."
+                "RMSE & MAPE dihitung dari 12 bulan terakhir fitted vs aktual (in-sample). "
+                "MAPE < 10% = sangat baik | 10–20% = baik | > 20% = perlu perhatian."
             )
             st.dataframe(
                 pd.DataFrame(selectedMetrics).set_index("Model"),
                 use_container_width=True,
             )
 
-    else:
-        st.info("Pilih minimal satu model di atas untuk melihat grafik tren.")
+            # ── Tabel detail aktual vs prediksi per model ──────────────────────────
+            st.markdown("**Detail Aktual vs Prediksi (12 bulan terakhir)**")
+            for sel in selected:
+                cleanSel = sel.replace(" [discontinue]", "")
+                try:
+                    _, brandPart = cleanSel.split(" ", 1)
+                    brand, model = brandPart.split(" - ", 1)
+                except ValueError:
+                    continue
 
+                dfIdx = modelToDfIdx.get((brand, model))
+                if dfIdx is None:
+                    continue
+
+                m = metricsDict.get(dfIdx, {})
+                if m.get("discontinued") or not fittedSeriesDict.get(dfIdx):
+                    continue
+
+                historical = df.loc[dfIdx, monthCols].values.astype(float)
+                fitted     = fittedSeriesDict.get(dfIdx, [])
+
+                if not fitted or len(fitted) < 12:
+                    continue
+
+                # Ambil 12 bulan terakhir
+                evalN       = min(12, len(historical) - 12)
+                actualEval  = historical[-evalN:]
+                fittedEval  = np.array(fitted[-evalN:])
+                labelEval   = yearLabels[-evalN:]
+
+                detailRows = []
+                for lbl, act, pred in zip(labelEval, actualEval, fittedEval):
+                    act   = float(act)
+                    pred  = float(pred)
+                    err   = act - pred
+                    pct   = abs(err / act) * 100 if act > 0 else None
+                    detailRows.append({
+                        "Bulan":        lbl,
+                        "Aktual":       int(round(act)),
+                        "Prediksi":     int(round(pred)),
+                        "Error":        int(round(err)),
+                        "APE (%)":      round(pct, 2) if pct is not None else None,
+                    })
+
+                detailDf = pd.DataFrame(detailRows)
+
+                # Hitung ulang RMSE & MAPE dari tabel ini (verifikasi)
+                rmseVerif = float(np.sqrt(np.mean((detailDf["Error"]) ** 2)))
+                mapeVerif = detailDf["APE (%)"].dropna().mean()
+
+                with st.expander(f"📊 {brand} {model} — RMSE: {rmseVerif:,.1f} | MAPE: {mapeVerif:.2f}%"):
+                    st.dataframe(
+                        detailDf.set_index("Bulan"),
+                        use_container_width=True,
+                        column_config={
+                            "Aktual":   st.column_config.NumberColumn(format="%d"),
+                            "Prediksi": st.column_config.NumberColumn(format="%d"),
+                            "Error":    st.column_config.NumberColumn(format="%d"),
+                            "APE (%)":  st.column_config.NumberColumn(format="%.2f%%"),
+                        },
+                    )
+                    st.caption( 
+                        f"RMSE (verifikasi manual): **{rmseVerif:,.1f}** &nbsp;|&nbsp; "
+                        f"MAPE (verifikasi manual): **{mapeVerif:.2f}%**"
+                    )
+            else:
+                st.info("Pilih minimal satu model di atas untuk melihat grafik tren.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — EOQ
+# ═══════════════════════════════════════════════════════════════════════════════
 with tabEoq:
-    st.markdown("<h3>Rekomendasi Pembelian Suku Cadang Fast-Moving</h3>", unsafe_allow_html=True)
+    st.markdown("<h3>Rekomendasi Pembelian Suku Cadang Fast-Moving</h3>",
+                unsafe_allow_html=True)
 
-    komponen = {
-        "Filter Oli":   2.0,
-        "Oli Mesin":    2.0,
-        "Filter Udara": 1.0,
-        "Kampas Rem":   0.5,
-        "Busi":         0.5,
-    }
-
-    topNEoq = st.slider("Hitung EOQ untuk Top-N model", 1, 10, 5)
+    topNEoq  = st.slider("Hitung EOQ untuk Top-N model", 1, 10, 5)
     topEoqDf = rankedDf.head(topNEoq).copy()
 
-    scoreMin = float(topEoqDf["score"].min())
-    scoreMax = float(topEoqDf["score"].max())
-    scoreDiff = scoreMax - scoreMin
+    # ── Demand berbasis proporsi tren penjualan C1 ────────────────────────────
+    # C1_total = akumulasi historis + forecast (kalau aktif).
+    # Proporsi tiap model = C1_model / sum(C1 semua Top-N).
+    # Demand tahunan model = proporsi × kapasitas_bengkel_per_tahun.
+    # Logika: bengkel melayani sebanyak targetServis kendaraan/bulan,
+    # dan model yang lebih banyak terjual di pasar = lebih besar kemungkinan masuk bengkel.
 
-    def normalizeScore(s):
-        if scoreDiff == 0:
-            return 0.5
-        return (float(s) - scoreMin) / scoreDiff
+    totalC1 = float(topEoqDf["C1_total"].sum())
+
+    kapasitasTahunan = targetServis * 12  # kendaraan/tahun yang dilayani bengkel
+
+    st.info(
+        f"**Kapasitas bengkel:** `{targetServis} kendaraan/bulan` "
+        f"= `{kapasitasTahunan:,} kendaraan/tahun`  \n"
+        f"**Demand per model** = proporsi tren penjualan C1 × kapasitas bengkel × frekuensi komponen.  \n"
+        f"Total C1 Top-{topNEoq}: `{totalC1:,.0f}` unit (dari data Gaikindo{' + forecast' if enableForecast else ''})."
+    )
+
+    with st.expander("ℹ️ Penjelasan frekuensi penggantian komponen", expanded=False):
+        st.markdown("""
+        | Komponen | Frekuensi/tahun | Keterangan |
+        |----------|----------------|------------|
+        | Filter Oli | 2× | Ganti tiap ~6 bulan atau ~10.000 km |
+        | Oli Mesin | 2× | Bersamaan dengan filter oli |
+        | Filter Udara | 1× | Ganti tiap ~12 bulan atau ~20.000 km |
+        | Kampas Rem | 0,5× | Ganti tiap ~2 tahun atau ~40.000 km |
+        | Busi | 0,5× | Ganti tiap ~2 tahun (busi konvensional) |
+        """)
 
     eoqRows = []
     for rank, row in topEoqDf.iterrows():
-        norm = normalizeScore(row["score"])
-        for compName, freq in komponen.items():
-            demand = int(round(targetServis * freq * (1 + norm) * 12))
-            eoq    = calcEoq(demand, biayaPesan, biayaSimpan)
-            tic    = (demand / max(eoq, 1)) * biayaPesan + (eoq / 2) * biayaSimpan
+        c1Val    = float(row["C1_total"])
+        # proporsi model ini terhadap seluruh Top-N
+        proporsi = c1Val / totalC1 if totalC1 > 0 else 1.0 / max(len(topEoqDf), 1)
+
+        # kendaraan model ini yang dilayani bengkel per tahun
+        kendaraanPerTahun = kapasitasTahunan * proporsi
+
+        for compName, freqPerTahun in KOMPONEN.items():
+            # demand = kendaraan yg dilayani × frekuensi ganti komponen per tahun
+            demand = max(1, int(round(kendaraanPerTahun * freqPerTahun)))
+
+            eoq      = max(1, calcEoq(demand, biayaPesan, biayaSimpan))
+            freqPesan = round(demand / eoq, 1)
+            tic       = (demand / eoq) * biayaPesan + (eoq / 2) * biayaSimpan
+
             eoqRows.append({
-                "Rank":              rank,
-                "Model":             f"{row['Brand']} {row['Model']}",
-                "Komponen":          compName,
-                "Demand/Tahun":      demand,
-                "EOQ (pcs)":         eoq,
-                "Total Biaya/Tahun": f"Rp {tic:,.0f}",
+                "Rank":                   rank,
+                "Model":                  f"{row['Brand']} {row['Model']}",
+                "Komponen":               compName,
+                "Proporsi C1 (%)":        round(proporsi * 100, 2),
+                "Est. Kendaraan/Thn":     demand // int(freqPerTahun) if freqPerTahun >= 1 else demand * 2,
+                "Demand/Thn (pcs)":       demand,
+                "EOQ (pcs/pesan)":        eoq,
+                "Frekuensi Pesan/Thn":    freqPesan,
+                "Est. Total Biaya/Thn":   f"Rp {tic:,.0f}",
             })
 
     eoqDf = pd.DataFrame(eoqRows)
-    st.dataframe(eoqDf, use_container_width=True, hide_index=True)
+
+    st.dataframe(
+        eoqDf,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Proporsi C1 (%)": st.column_config.NumberColumn(
+                "Proporsi C1 (%)",
+                help="Porsi tren penjualan model ini dari total Top-N.",
+                format="%.2f%%",
+            ),
+            "Demand/Thn (pcs)": st.column_config.NumberColumn(
+                "Demand/Thn (pcs)",
+                help="Estimasi jumlah komponen yang dibutuhkan per tahun.",
+                format="%d",
+            ),
+            "EOQ (pcs/pesan)": st.column_config.NumberColumn(
+                "EOQ (pcs/pesan)",
+                help=(
+                    "Jumlah unit optimal dibeli SEKALI PESAN "
+                    "untuk meminimalkan total biaya pesan + simpan."
+                ),
+                format="%d",
+            ),
+            "Frekuensi Pesan/Thn": st.column_config.NumberColumn(
+                "Frekuensi Pesan/Thn",
+                help="Berapa kali pesan dalam setahun = Demand ÷ EOQ.",
+                format="%.1f×",
+            ),
+        },
+    )
+
+    csv = eoqDf.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download Hasil EOQ (CSV)",
+        data=csv,
+        file_name="hasil_rekomendasi_eoq.csv",
+        mime="text/csv",
+    )
 
 st.divider()
 st.caption("2026 — Sistem Rekomendasi Suku Cadang Fast Moving — Kelvyn — Skripsi S1 Teknik Informatika")
